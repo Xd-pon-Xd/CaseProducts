@@ -2,21 +2,45 @@ import sys
 import io
 import re
 import sqlite3
-
-# 1. Заставляем терминал дружить с русским языком
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+import datetime
 from natasha import Segmenter, MorphVocab, NewsEmbedding, NewsMorphTagger, Doc
 
+# Заставляем терминал дружить с русским языком
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+
 def clean_recipe_text(raw_text: str) -> str:
-    #Отсекает инструкцию по приготовлению, оставляя только ингредиенты.
-    markers = ["приготовление", "инструкция", "шаги", "способ приготовления", "как готовить", "процесс"]
+    markers = ["приготовление", "инструкция", "шаги", "способ приготовления", "как готовить", "процесс", "шаг 1"]
     text_lower = raw_text.lower()
     for marker in markers:
         if marker in text_lower:
-            marker_index = text_lower.find(marker)
-            return raw_text[:marker_index].strip()
+            return raw_text[:text_lower.find(marker)].strip()
     return raw_text.strip()
+
+def extract_recipe_title(raw_text: str) -> str:
+    # Умный анализ текста для извлечения названия рецепта.
+    lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
+    if not lines:
+        return "Новый рецепт"
+        
+    first_line = lines[0]
+    
+    # 1. Проверка на слишком длинную строку (название не должно быть целым абзацем)
+    if len(first_line) > 40:
+        return f"Рецепт {datetime.date.today().strftime('%d.%m.%Y')}"
+        
+    # 2. Проверка: если в первой строке уже есть цифры и единицы измерения,
+    # значит пользователь забыл название и сразу начал с ингредиентов.
+    pattern_has_ingredients = r'\d+\s*(кг|мл|шт|г|гр|литр|ложка|ст|ч)'
+    if re.search(pattern_has_ingredients, first_line.lower()):
+        # Названия нет, возвращаем дефолтное с датой
+        return f"Рецепт {datetime.date.today().strftime('%d.%m.%Y')}"
+        
+    # 3. Если строчка чистая, убираем из неё лишние знаки препинания в конце (если есть)
+    clean_title = first_line.rstrip('.:!,- ')
+    
+    return clean_title.capitalize()
 
 def parse_ingredients_simple_ai(cleaned_text: str) -> list:
     # Инициализируем ИИ Natasha
@@ -175,39 +199,17 @@ def get_combined_shopping_list(recipe_ids: list) -> list:
     return shopping_list
 
 if __name__ == "__main__":
-    print("--- ЛОКАЛЬНЫЙ ТЕСТ СИСТЕМЫ ОБЪЕДИНЕНИЯ РЕЦЕПТОВ ---")
-    init_db() # Создаем таблицы, если их нет
+    print("--- ТЕСТ УМНОГО ОПРЕДЕЛЕНИЯ НАЗВАНИЙ ---")
     
-    # Имитируем одного пользователя
-    user_id = 777
+    # Случай 1: Написал как надо
+    text_perfect = "Итальянская пицца\nТесто - 200г\nСыр - 100г"
     
-    # Рецепт 1
-    title_1 = "Утренний омлет"
-    text_1 = "Яйца - 3 шт\nМолоко - 100 мл\nПомидоры - 1 шт"
+    # Случай 2: Забыл название, написал сразу продукты
+    text_lazy = "500г курицы\n3 шт картошки"
     
-    # Рецепт 2
-    title_2 = "Итальянская паста"
-    text_2 = "Томаты - 2 шт\nМука - 200 г\nЯйца - 2 шт"
-    
-    # 1. Пропускаем оба рецепта через ИИ и сохраняем в БД
-    print(f"\nРазбираем: {title_1}...")
-    ingr_1 = parse_ingredients_simple_ai(clean_recipe_text(text_1))
-    id_1 = save_recipe_to_db(user_id, title_1, ingr_1)
-    
-    print(f"Разбираем: {title_2}...")
-    ingr_2 = parse_ingredients_simple_ai(clean_recipe_text(text_2))
-    id_2 = save_recipe_to_db(user_id, title_2, ingr_2)
-    
-    # 2. Тестируем калькулятор объединения (как будто пользователь выбрал оба этих блюда)    
-    # Передаем список ID рецептов, которые хотим объединить
-    chosen_recipes = [id_1, id_2] 
-    
-    # В коде ТГ-бота мы использовали встроенный кусок, давай вызовем get_combined_shopping_list
-    # (Убедись, что функция get_combined_shopping_list есть у тебя в коде выше)
-    shopping_list = get_combined_shopping_list(chosen_recipes)
-    
-    print("\n🛒 ИТОГОВЫЙ СПИСОК ПОКУПОК:")
-    print("-" * 30)
-    for item in shopping_list:
-        print(f"• {item['name'].capitalize()} — {item['amount']} {item['unit']}")
-    print("-" * 30)
+    # Случай 3: Пользователь написал слишком длинную строку вместо названия
+    text_long = "Я вчера готовил суп, ну он в целом норм, так что сделаем:\nВода - 2 л\nМясо - 300 г"
+
+    print(f"Текст 1 -> Определено название: '{extract_recipe_title(text_perfect)}'")
+    print(f"Текст 2 -> Определено название: '{extract_recipe_title(text_lazy)}'")
+    print(f"Текст 3 -> Определено название: '{extract_recipe_title(text_long)}'")
