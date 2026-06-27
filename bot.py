@@ -42,66 +42,142 @@ def extract_recipe_title(raw_text: str) -> str:
     
     return clean_title.capitalize()
 
-def parse_ingredients_simple_ai(cleaned_text: str) -> list:
-    # Инициализируем ИИ Natasha
+def parse_ingredients_advanced(raw_text: str) -> list:
     segmenter = Segmenter()
     morph_vocab = MorphVocab()
     emb = NewsEmbedding()
     morph_tagger = NewsMorphTagger(emb)
     
-    ingredients_list = []
-    #Заменяем слова на краткие формы, чтобы избежать проблемы с регулярными выражениями
-    text = cleaned_text.lower()
+    # Блок замен
+    text = raw_text.lower()
     text = text.replace("килограмм", "кг").replace("кило", "кг")
     text = text.replace("грамм", "г").replace("гр", "г")
-    text = text.replace("милилитров", "мл").replace("милилитр", "мл")
+    text = text.replace("миллилитров", "мл").replace("миллилитр", "мл").replace("милилитр", "мл")
     text = text.replace("литров", "л").replace("литра", "л").replace("литр", "л")
-
-    # Шаблон для поиска Числа и Единицы измерения в строке
-    pattern = r'(\d+[\.,]?\d*)\s*(кг|мл|шт|ст\.\s*л\.|ч\.\s*л\.|зубчик|пучок|стакан|г|л)?'
     
-    # Режем текст по строкам
-    lines = text.split('\n')
+    text = text.replace("столовая ложка", "л").replace("столовые ложки", "л").replace("ст. ложки", "л").replace("ст. л.", "л").replace("ст.л.", "л")
+    text = text.replace("чайная ложка", "л").replace("чайные ложки", "л").replace("ч. ложки", "л").replace("ч. л.", "л").replace("ч.л.", "л")
+    text = text.replace("ложки", "л").replace("ложка", "л").replace("ложку", "л")
     
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue # Пропускаем пустые строки
+    # Убираем знаки препинания, чтобы не мешать стыковке слов
+    text = re.sub(r'(?<!\d)[,;\\.](?!\d)', ' ', text)
+    text = re.sub(r'\s+', ' ', text) # Удаляем лишние пробелы
+    
+    units_pattern = r'(кг|мл|шт|г|л)'
+    
+    # --- УМНОЕ УДАЛЕНИЕ ДУБЛИРУЮЩИХ СКОБОК ЛЮБОЙ ДЛИНЫ ---
+    # Находим единицу измерения, после которой идет любая скобка, содержащая внутри хотя бы одну цифру
+    # Это сотрет и "(2 л)", и "(около 1,5 стакана ёмкостью 200 мл)"
+    text = re.sub(r'\b' + units_pattern + r'\b\s*\([^)]*\d+[^)]*\)', r'\1', text)
+    
+    ingredients_list = []
+    
+    while True:
+        # Ищем паттерн количества: цифра (целая или дробная) + ед. измерения
+        match = re.search(r'\(?(\d+[\d\.,\-/]*)\s*' + units_pattern + r'?\)?', text)
+        if not match:
+            break
             
-        # Ищем число и единицу измерения в текущей строке
-        match = re.search(pattern, line.lower())
+        raw_amount = match.group(1)
+        unit = match.group(2) if match.group(2) else "шт"
         
-        if match:
-            amount = float(match.group(1).replace(',', '.'))
-            unit = match.group(2) if match.group(2) else "шт"
+        num_start, num_end = match.start(), match.end()
+        left_part = text[:num_start].strip()
+        right_part = text[num_end:].strip()
+        
+        # Очищаем левую часть от тире, двоеточия на концах слов
+        left_part_clean = re.sub(r'[:\-=\s]+$', '', left_part).strip()
+        left_words = left_part_clean.split()
+        right_words = right_part.split()
+        
+        product_name = ""
+        
+        # --- ПРОСМОТР СЛЕВА ---
+        if left_words:
+            # Пропускаем текстовые скобки типа "(или растительное)", если они остались
+            if left_words[-1].endswith(')'):
+                left_str = " ".join(left_words)
+                open_bracket_idx = left_str.rfind('(')
+                if open_bracket_idx != -1:
+                    left_words = left_str[:open_bracket_idx].strip().split()
             
-            # Вырезаем число и единицу из строки, остальное — это название продукта
-            raw_name = re.sub(pattern, '', line.lower())
-            raw_name = raw_name.replace('-', '').replace(':', '').strip()
+            # Фильтруем левые слова от тире и знаков препинания
+            left_words = [w for w in left_words if w not in ['-', '—', '–', ':', '=']]
             
-            # Подключаем ИИ для работы со словами (форма слова, части речи)
-            doc = Doc(raw_name)
-            doc.segment(segmenter) #разбитие по токенам
-            doc.tag_morph(morph_tagger) #части речи
+            if left_words:
+                words_to_analyze = left_words[-2:] if len(left_words) >= 2 else [left_words[-1]]
+                # Убираем возможные тире из самих слов
+                words_to_analyze = [w.replace('-', '').replace('—', '') for w in words_to_analyze]
+                candidate_raw = " ".join(words_to_analyze).strip()
+                
+                doc = Doc(candidate_raw)
+                doc.segment(segmenter)
+                doc.tag_morph(morph_tagger)
+                pos_tags = [t.pos for t in doc.tokens]
+                
+                if len(pos_tags) == 2 and pos_tags[0] == 'NOUN' and pos_tags[1] == 'NOUN':
+                    product_name = words_to_analyze[-1]
+                else:
+                    product_name = candidate_raw
+                    
+                # Вырезаем найденный продукт из текста
+                pos = left_part.rfind(product_name)
+                if pos != -1:
+                    text = left_part[:pos].strip() + " " + right_part
+                else:
+                    text = left_part_clean[:-len(product_name)].strip() + " " + right_part
+                    
+        # --- ПРОСМОТР СПРАВА ---
+        if not product_name and right_words:
+            # Очищаем правые слова от мусора
+            right_words = [w for w in right_words if w not in ['-', '—', '–', ':', '=']]
+            if right_words:
+                words_to_analyze = right_words[:2] if len(right_words) >= 2 else [right_words[0]]
+                candidate_raw = " ".join(words_to_analyze).replace('(', '').replace(')', '').replace('-', '')
+                
+                doc = Doc(candidate_raw)
+                doc.segment(segmenter)
+                doc.tag_morph(morph_tagger)
+                pos_tags = [t.pos for t in doc.tokens]
+                
+                if len(pos_tags) == 2 and pos_tags[0] == 'NOUN' and pos_tags[1] == 'NOUN':
+                    product_name = words_to_analyze[0]
+                else:
+                    product_name = candidate_raw
+                    
+                pos = right_part.find(words_to_analyze[0])
+                if pos != -1:
+                    text = left_part + " " + right_part[pos + len(product_name):].strip()
+                else:
+                    text = left_part + " " + right_part
+                    
+        # Математика количества (парсинг дробей)
+        try:
+            if '-' in raw_amount: raw_amount = raw_amount.split('-')[-1]
+            if '/' in raw_amount:
+                num, denom = raw_amount.split('/')
+                amount = float(num) / float(denom)
+            else:
+                amount = float(raw_amount.replace(',', '.'))
+        except:
+            amount = 1.0
             
-            # Собираем слова, приведенные ИИ к начальной форме (лемме)
+        # Лемматизация названия продукта через ИИ Natasha
+        if product_name:
+            product_name = re.sub(r'[:\-=\(\)]', '', product_name).strip()
+            doc = Doc(product_name)
+            doc.segment(segmenter)
+            doc.tag_morph(morph_tagger)
+            
             lemma_words = []
             for token in doc.tokens:
                 token.lemmatize(morph_vocab)
-                # Берем только существительные и прилагательные (минусуем предлоги и мусор)
                 if token.pos in ['NOUN', 'ADJ']:
                     lemma_words.append(token.lemma)
-            
-            # Объединяем слова обратно в красивое название
+                    
             clean_name = " ".join(lemma_words)
-            
-            # Если имя после чистки не пустое, добавляем в список
-            if clean_name:
-                ingredients_list.append({
-                    "name": clean_name,
-                    "amount": amount,
-                    "unit": unit
-                })
+            if clean_name and clean_name not in ['продукты']: # Отсекаем заголовок секции, если он попался
+                ingredients_list.append({"name": clean_name, "amount": amount, "unit": unit})
                 
     return ingredients_list
 
@@ -199,17 +275,20 @@ def get_combined_shopping_list(recipe_ids: list) -> list:
     return shopping_list
 
 if __name__ == "__main__":
-    print("--- ТЕСТ УМНОГО ОПРЕДЕЛЕНИЯ НАЗВАНИЙ ---")
+    print("--- ТЕСТ СУЩЕСТВИТЕЛЬНЫХ ---")
     
-    # Случай 1: Написал как надо
-    text_perfect = "Итальянская пицца\nТесто - 200г\nСыр - 100г"
+    test_1 = "3 яйца, мука 200 г, масло сливочное 30 г, морковь (2шт), капуста(3шт)"
+    test_2 = "молоко 500мл  яйца 3 шт.  мука 0.5 г масло сливочное (или растительное) 30 г (3 ст. ложки) сахар 30 г (2 ст. ложки) соль 2-3 г (1/2 ч. ложки)"
+    test_3 = "Продукты Молоко - 400 мл Вода - 100 мл Яйца - 2 шт. Масло растительное - 30 мл (2 ст. ложки) Мука - 200 г (около 1,5 стакана ёмкостью 200 мл) Сахар - 2 ст. ложки Соль - 0,25 ч. ложки Масло сливочное для смазывания блинов - 50 г"
     
-    # Случай 2: Забыл название, написал сразу продукты
-    text_lazy = "500г курицы\n3 шт картошки"
-    
-    # Случай 3: Пользователь написал слишком длинную строку вместо названия
-    text_long = "Я вчера готовил суп, ну он в целом норм, так что сделаем:\nВода - 2 л\nМясо - 300 г"
+    print("\nТест 1 (Прилагательное + Существительное):")
+    for item in parse_ingredients_advanced(test_1):
+        print(f"• {item['name'].capitalize()} — {item['amount']} {item['unit']}")
+        
+    print("\nТест 2 (Два существительных подряд влево):")
+    for item in parse_ingredients_advanced(test_2):
+        print(f"• {item['name'].capitalize()} — {item['amount']} {item['unit']}")
 
-    print(f"Текст 1 -> Определено название: '{extract_recipe_title(text_perfect)}'")
-    print(f"Текст 2 -> Определено название: '{extract_recipe_title(text_lazy)}'")
-    print(f"Текст 3 -> Определено название: '{extract_recipe_title(text_long)}'")
+    print("\nТест 3 (Два существительных подряд вправо):")
+    for item in parse_ingredients_advanced(test_3):
+        print(f"• {item['name'].capitalize()} — {item['amount']} {item['unit']}")
