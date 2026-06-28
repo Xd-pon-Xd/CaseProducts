@@ -2,6 +2,8 @@ import asyncio
 import logging
 import sys
 import io
+import os
+from image_ocr import extract_text_from_image
 from aiogram import Bot, Dispatcher, html, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -241,15 +243,71 @@ async def clear_list_callback(callback: CallbackQuery):
     # Меняем текст сообщения
     await callback.message.edit_text("🗑️ <b>Ваш список покупок был полностью очищен.</b>")
 
-# Заглушка под EasyOCR
+# ЛОВИМ ФОТОГРАФИЮ НАПРЯМУЮ (Рецепт по фото)
 @dp.message(F.photo)
 async def process_photo_handler(message: Message) -> None:
+    user_id = message.from_user.id
+    recipe_name = "Рецепт по фото"
+    
+    # Сообщаем пользователю, что начали работу
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    await asyncio.sleep(1) 
-    await message.answer(
-        "📸 Вижу твою фотку! Модуль EasyOCR уже на подходе. "
-        "Совсем скоро ты сможешь загружать сюда рукописные рецепты, и я их распаршу!"
-    )
+    status_msg = await message.answer("📥 <b>Скачиваю и обрабатываю изображение...</b>")
+    
+    try:
+        # 1. Получаем фотографию
+        photo = message.photo[-1]
+        file_info = await message.bot.get_file(photo.file_id)
+        
+        # Задаем имя для временного файла в папке проекта
+        temp_image_path = f"temp_user_{user_id}.jpg"
+        
+        # Скачиваем файл из серверов Телеграма к себе на компьютер
+        await message.bot.download_file(file_info.file_path, temp_image_path)
+        
+        await status_msg.edit_text("🔍 <b>EasyOCR сканирует рукописный текст на фото...</b>")
+        
+        # 2. Запускаем EasyOCR в отдельном потоке (to_thread), чтобы бот не зависал
+        loop = asyncio.get_running_loop()
+        extracted_text = await loop.run_in_executor(None, extract_text_from_image, temp_image_path)
+        
+        # Удаляем временное изображение, оно нам больше не нужно
+        if os.path.exists(temp_image_path):
+            os.remove(temp_image_path)
+            
+        if not extracted_text:
+            await status_msg.edit_text("❌ Не удалось разобрать текст на фотографии. Попробуй сделать фото четче!")
+            return
+
+        # 3. Передаем распознанный текст ИИ-парсеру (точно так же, как в ссылках и тексте)
+        await status_msg.edit_text(f"🧠 <b>ИИ анализирует продукты из найденного текста...</b>")
+        parsed_ingredients = await parse_ingredients_with_llm(extracted_text)
+        
+        if not parsed_ingredients:
+            await status_msg.edit_text("❌ Текст с фото распознан, но ИИ не нашёл в нём кулинарных ингредиентов.")
+            return
+            
+        # 4. Сохраняем результат в базу данных
+        db.save_ingredients(user_id, recipe_name, parsed_ingredients)
+        
+        # Формируем красивый финальный ответ
+        response_text = f"<b>📋 Спарсено с фотографии в '{recipe_name}':</b>\n"
+        response_text += "────────────────────\n"
+        for item in parsed_ingredients:
+            name = item.get('name', 'Неизвестно').capitalize()
+            amount = item.get('amount', 1.0)
+            unit = item.get('unit', 'шт')
+            if isinstance(amount, float) and amount.is_integer():
+                amount = int(amount)
+            response_text += f"🔹 <b>{name}</b> — <code>{amount} {unit}</code>\n"
+            
+        response_text += "────────────────────\n"
+        response_text += "💾 <i>Продукты добавлены в '📊 Мой список продуктов'!</i>"
+        
+        await status_msg.edit_text(response_text)
+
+    except Exception as e:
+        logging.error(f"Ошибка при обработке фото: {e}")
+        await status_msg.edit_text("⏳ Произошла ошибка при обработке картинки. Попробуй еще раз.")
 
 # --- ЛОВИМ ССЫЛКУ, ПРИСЛАННУЮ НАПРЯМУЮ БЕЗ КНОПОК ---
 @dp.message(F.text.startswith("http"))
