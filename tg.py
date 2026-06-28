@@ -1,14 +1,16 @@
 import asyncio
 import logging
 import sys
+import io
 from aiogram import Bot, Dispatcher, html, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 # Подключаем функцию парсинга из LLM_Parser.py
 from LLM_Parser import parse_ingredients_with_llm
-import io
+# Подключаем database.py
+import database as db
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
@@ -22,14 +24,26 @@ dp = Dispatcher()
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     kb = [
         [KeyboardButton(text="📖 Как это работает?"), KeyboardButton(text="💡 Примеры ввода")],
-        [KeyboardButton(text="📊 Мой список продуктов (Скоро)")]
+        [KeyboardButton(text="📊 Мой список продуктов")]
     ]
     # resize_keyboard=True делает кнопки аккуратными, а не на пол-экрана
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
+# Инлайн-кнопка для очистки списка
+def get_clear_inline_kb() -> InlineKeyboardMarkup:
+    inline_btn = InlineKeyboardButton(text="🗑️ Очистить весь список", callback_data="clear_list")
+    return InlineKeyboardMarkup(inline_keyboard=[[inline_btn]])
+
 # 1. ХЭНДЛЕР НА /start
 @dp.message(CommandStart())
 async def command_start_handler(message: Message) -> None:
+    # Регистрация пользователя в БД
+    db.add_user(
+        user_id=message.from_user.id,
+        username=message.from_user.username or "unknown",
+        first_name=message.from_user.first_name
+    )
+
     await message.answer(
         f"Привет, {html.bold(message.from_user.full_name)}! ✨\n\n"
         f"Я твой умный кулинарный ассистент на базе нейросети {html.code('Gemma 3 / Llama')}.\n\n"
@@ -69,31 +83,55 @@ async def toggle_tips_handler(message: Message) -> None:
     await message.answer(tips_text)
 
 # 4. ХЭНДЛЕР НА КНОПКУ "Мой список продуктов"
-@dp.message(F.text == "📊 Мой список продуктов (Скоро)")
-async def status_handler(message: Message) -> None:
-    status_text = (
-        "<b>🚧 Модуль базы данных в разработке</b>\n\n"
-        "Совсем скоро здесь будет храниться твой персональный список покупок, где "
-        "ингредиенты из разных рецептов будут автоматически суммироваться! 🚀"
-    )
-    await message.answer(status_text)
+@dp.message(F.text == "📊 Мой список продуктов")
+async def show_shopping_list_handler(message: Message) -> None:
+    user_id = message.from_user.id
+    products = db.get_aggregated_ingredients(user_id)
+    
+    if not products:
+        await message.answer("🛒 <b>Твой список продуктов пока пуст.</b>\nПришли мне какой-нибудь рецепт, чтобы наполнить его!")
+        return
+        
+    response_text = "<b>🛒 Ваш суммированный список покупок:</b>\n"
+    response_text += "────────────────────\n"
+    
+    for item in products:
+        name = item['name'].capitalize()
+        amount = item['amount']
+        unit = item['unit']
+        
+        if isinstance(amount, float) and amount.is_integer():
+            amount = int(amount)
+            
+        response_text += f"✅ <b>{name}</b> — <code>{amount} {unit}</code>\n"
+        
+    response_text += "────────────────────\n"
+    
+    await message.answer(response_text, reply_markup=get_clear_inline_kb())
 
-# 5. ХЭНДЛЕР НА ФОТОГРАФИИ (Заглушка под EasyOCR)
+# --- ОБРАБОТКА НАЖАТИЯ НА КНОПКУ ОЧИСТКИ ---
+@dp.callback_query(F.data == "clear_list")
+async def clear_list_callback(callback: CallbackQuery):
+    db.clear_user_products(callback.from_user.id)
+    # Отправляем всплывающее уведомление в ТГ
+    await callback.answer("Список покупок успешно очищен!")
+    # Меняем текст сообщения
+    await callback.message.edit_text("🗑️ <b>Ваш список покупок был полностью очищен.</b>")
+
+# Заглушка под EasyOCR
 @dp.message(F.photo)
 async def process_photo_handler(message: Message) -> None:
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
-    # Имитируем бурную деятельность, пока OCR не подключен
     await asyncio.sleep(1) 
     await message.answer(
         "📸 Вижу твою фотку! Модуль EasyOCR уже на подходе. "
         "Совсем скоро ты сможешь загружать сюда рукописные рецепты, и я их распаршу!"
     )
 
-# 6. НАШ ГЛАВНЫЙ ХЭНДЛЕР ПАРСИНГА ТЕКСТА
 @dp.message(F.text)
 async def process_recipe_handler(message: Message) -> None:
     raw_text = message.text
-    
+    user_id = message.from_user.id
     # Отправляем статус "typing", чтобы пользователь видел анимацию
     await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
@@ -106,10 +144,12 @@ async def process_recipe_handler(message: Message) -> None:
         if not parsed_ingredients:
             # Если ИИ вернул пустой список (например, текст вообще не про еду)
             await status_msg.edit_text(
-                "❌ <b>Хмм, не удалось найти ингредиенты.</b>\n\n"
+                "❌ <b>Не удалось найти ингредиенты.</b>\n\n"
                 "Убедись, что в тексте есть продукты и их количества, или попробуй перефразировать ввод."
             )
             return
+        
+        db.save_ingredients(user_id, parsed_ingredients)
             
         # Формируем финальный ответ
         response_text = "<b>📋 Ингредиенты успешно извлечены:</b>\n"
@@ -133,15 +173,12 @@ async def process_recipe_handler(message: Message) -> None:
     except Exception as e:
         logging.error(f"Ошибка в хэндлере ТГ: {e}")
         # Сообщение на случай перегрузки бесплатных серверов
-        await status_msg.edit_text(
-            "⏳ <b>Сервер ИИ временно перегружен запросами...</b>\n\n"
-            "Поскольку мы используем бесплатный шлюз, иногда нужно подождать. "
-            "Пожалуйста, <b>отправь этот же текст еще раз</b> через 3–5 секунд, и всё обязательно получится! 🙏"
-        )
+        await status_msg.edit_text("⏳ Сервер ИИ занят, попробуйте отправить текст еще раз через пару секунд!")
 
 async def main() -> None:
+    db.init_db()
     bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    print("Бот успешно запущен, кнопки добавлены!")
+    print("Бот успешно запущен")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
