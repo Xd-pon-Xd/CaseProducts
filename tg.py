@@ -7,6 +7,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+# Импортируем инструменты состояний
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 # Подключаем функцию парсинга из LLM_Parser.py
 from LLM_Parser import parse_ingredients_with_llm
 # Подключаем database.py
@@ -20,13 +23,17 @@ logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 TOKEN = "8504116605:AAHEFELkrW1VRd6lUgSZ7eRgQrFxCFkA8zI"
 dp = Dispatcher()
 
+# --- ОПРЕДЕЛЯЕМ СОСТОЯНИЯ БОТА ---
+class RecipeStates(StatesGroup):
+    waiting_for_recipe_name = State() # Бот ждет название блюда
+    waiting_for_recipe_text = State() # Бот ждет сам текст рецепта
+
 # --- СОЗДАЕМ КНОПКИ ДЛЯ МЕНЮ ---
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     kb = [
-        [KeyboardButton(text="📖 Как это работает?"), KeyboardButton(text="💡 Примеры ввода")],
-        [KeyboardButton(text="📊 Мой список продуктов")]
+        [KeyboardButton(text="➕ Добавить рецепт"), KeyboardButton(text="📊 Мой список продуктов")],
+        [KeyboardButton(text="📖 Как это работает?"), KeyboardButton(text="💡 Примеры ввода")]
     ]
-    # resize_keyboard=True делает кнопки аккуратными, а не на пол-экрана
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
 # Инлайн-кнопка для очистки списка
@@ -46,14 +53,109 @@ async def command_start_handler(message: Message) -> None:
 
     await message.answer(
         f"Привет, {html.bold(message.from_user.full_name)}! ✨\n\n"
-        f"Я твой умный кулинарный ассистент на базе нейросети {html.code('Gemma 3 / Llama')}.\n\n"
-        f"🟢 <b>Что я умею?</b>\n"
-        f"Ты отправляешь мне скопированный рецепт (или даже кучу мусорного текста с сайта), "
-        f"а я вытаскиваю из него чистый список продуктов, перевожу их в начальную форму "
-        f"и бережно считаю количество.\n\n"
-        f"👇 Воспользуйся меню или просто пришли мне текст рецепта!",
+        f"Я умный кулинарный органайзер. Теперь я умею группировать продукты по блюдам "
+        f"и автоматически переводить веса (килограммы в граммы, ложки в объемы) при суммировании!\n\n"
+        f"Нажми кнопку <b>'➕ Добавить рецепт'</b>, чтобы начать.",
         reply_markup=get_main_keyboard()
     )
+
+# --- НАЧАЛО СЦЕНАРИЯ ---
+@dp.message(F.text == "➕ Добавить рецепт")
+async def start_adding_recipe(message: Message, state: FSMContext):
+    await message.answer("🍳 <b>Введите название блюда</b> (напр. <i>Борщ, Блины, Торт Наполеон</i>):")
+    # Переключаем бота в состояние ожидания имени
+    await state.set_state(RecipeStates.waiting_for_recipe_name)
+
+# --- СЛЕДУЮЩИЙ ШАГ: ПОЛУЧИЛИ ИМЯ, ЖДЕМ ТЕКСТ ---
+@dp.message(RecipeStates.waiting_for_recipe_name)
+async def process_recipe_name(message: Message, state: FSMContext):
+    recipe_name = message.text.strip()
+    # Сохраняем имя во временную память aiogram
+    await state.update_data(chosen_recipe_name=recipe_name)
+    
+    await message.answer(f"📥 Отлично! Теперь отправь мне <b>сырой текст ингредиентов</b> для блюда '{html.bold(recipe_name)}':")
+    # Переключаем в состояние ожидания рецепта
+    await state.set_state(RecipeStates.waiting_for_recipe_text)
+
+# --- ФИНАЛ СЦЕНАРИЯ: ИИ + ЗАПИСЬ С НАЗВАНИЕМ БЛЮДА ---
+@dp.message(RecipeStates.waiting_for_recipe_text)
+async def process_recipe_text(message: Message, state: FSMContext):
+    raw_text = message.text
+    user_id = message.from_user.id
+    
+    # Достаем сохраненное имя блюда из контекста FSM
+    user_data = await state.get_data()
+    recipe_name = user_data.get('chosen_recipe_name', 'Без названия')
+    
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    status_msg = await message.answer(f"🧠 <b>ИИ анализирует ингредиенты для '{recipe_name}'...</b>")
+    
+    try:
+        parsed_ingredients = await parse_ingredients_with_llm(raw_text)
+        
+        if not parsed_ingredients:
+            await status_msg.edit_text("❌ Не удалось найти ингредиенты. Попробуйте еще раз.")
+            return
+            
+        # СОХРАНЯЕМ В БД ВМЕСТЕ С НАЗВАНИЕМ БЛЮДА
+        db.save_ingredients(user_id, recipe_name, parsed_ingredients)
+        
+        response_text = f"<b>📋 Добавлено в рецепт '{recipe_name}':</b>\n"
+        response_text += "────────────────────\n"
+        for item in parsed_ingredients:
+            name = item.get('name', 'Неизвестно').capitalize()
+            amount = item.get('amount', 1.0)
+            unit = item.get('unit', 'шт')
+            if isinstance(amount, float) and amount.is_integer():
+                amount = int(amount)
+            response_text += f"🔹 <b>{name}</b> — <code>{amount} {unit}</code>\n"
+            
+        response_text += "────────────────────\n"
+        response_text += "💾 <i>Данные успешно сохранены! Можете добавить еще один рецепт или открыть итоговый список.</i>"
+        
+        await status_msg.edit_text(response_text)
+        # СБРАСЫВАЕМ СОСТОЯНИЕ, БОТ СНОВА ГОТОВ КО ВСЕМУ
+        await state.clear()
+        
+    except Exception as e:
+        logging.error(f"Ошибка в хэндлере: {e}")
+        await status_msg.edit_text("⏳ Ошибка ИИ сервера. Попробуйте отправить текст рецепта еще раз.")
+
+# --- ВЫВОД СПИСКА ПОКУПОК С УМНЫМ СУММИРОВАНИЕМ ВЕСОВ И СПИСКОМ БЛЮД ---
+@dp.message(F.text == "📊 Мой список продуктов")
+async def show_shopping_list_handler(message: Message) -> None:
+    user_id = message.from_user.id
+    
+    # Получаем список блюд, которые ввел пользователь
+    recipes = db.get_user_recipes(user_id)
+    products = db.get_aggregated_ingredients(user_id)
+    
+    if not products:
+        await message.answer("🛒 <b>Твой список продуктов пуст.</b>\nНажми '➕ Добавить рецепт'!")
+        return
+        
+    # Формируем шапку со списком блюд
+    response_text = "<b>📋 Корзина собрана на основе блюд:</b>\n"
+    response_text += ", ".join([f"<i>{r}</i>" for r in recipes]) + "\n"
+    response_text += "────────────────────\n"
+    response_text += "<b>🛒 Итоговый список покупок (с переводом весов):</b>\n\n"
+    
+    for item in products:
+        name = item['name'].capitalize()
+        amount = item['amount']
+        unit = item['unit']
+        
+        # Красиво округляем, чтобы не было 10.0000001
+        if isinstance(amount, float):
+            amount = round(amount, 2)
+            if amount.is_integer():
+                amount = int(amount)
+                
+        response_text += f"✅ <b>{name}</b> — <code>{amount} {unit}</code>\n"
+        
+    response_text += "────────────────────\n"
+    
+    await message.answer(response_text, reply_markup=get_clear_inline_kb())
 
 # 2. ХЭНДЛЕР НА /help ИЛИ КНОПКУ "Как это работает"
 @dp.message(Command("help"))
@@ -82,33 +184,6 @@ async def toggle_tips_handler(message: Message) -> None:
     )
     await message.answer(tips_text)
 
-# 4. ХЭНДЛЕР НА КНОПКУ "Мой список продуктов"
-@dp.message(F.text == "📊 Мой список продуктов")
-async def show_shopping_list_handler(message: Message) -> None:
-    user_id = message.from_user.id
-    products = db.get_aggregated_ingredients(user_id)
-    
-    if not products:
-        await message.answer("🛒 <b>Твой список продуктов пока пуст.</b>\nПришли мне какой-нибудь рецепт, чтобы наполнить его!")
-        return
-        
-    response_text = "<b>🛒 Ваш суммированный список покупок:</b>\n"
-    response_text += "────────────────────\n"
-    
-    for item in products:
-        name = item['name'].capitalize()
-        amount = item['amount']
-        unit = item['unit']
-        
-        if isinstance(amount, float) and amount.is_integer():
-            amount = int(amount)
-            
-        response_text += f"✅ <b>{name}</b> — <code>{amount} {unit}</code>\n"
-        
-    response_text += "────────────────────\n"
-    
-    await message.answer(response_text, reply_markup=get_clear_inline_kb())
-
 # --- ОБРАБОТКА НАЖАТИЯ НА КНОПКУ ОЧИСТКИ ---
 @dp.callback_query(F.data == "clear_list")
 async def clear_list_callback(callback: CallbackQuery):
@@ -128,51 +203,45 @@ async def process_photo_handler(message: Message) -> None:
         "Совсем скоро ты сможешь загружать сюда рукописные рецепты, и я их распаршу!"
     )
 
+# Этот хэндлер ловит рецепты, которые прислали напрямую (без нажатия кнопки)
 @dp.message(F.text)
 async def process_recipe_handler(message: Message) -> None:
     raw_text = message.text
     user_id = message.from_user.id
-    # Отправляем статус "typing", чтобы пользователь видел анимацию
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
     
-    # Первое статусное сообщение, чтобы пользователь понимал, что процесс идет
-    status_msg = await message.answer("🧠 <b>Нейросеть изучает текст рецепта...</b>\n<i>Это может занять несколько секунд.</i>")
+    # Задаем дефолтное имя, так как пользователь не нажимал кнопку
+    recipe_name = "Быстрый рецепт"
+    
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    status_msg = await message.answer("🧠 <b>ИИ анализирует рецепт...</b>")
     
     try:
         parsed_ingredients = await parse_ingredients_with_llm(raw_text)
         
         if not parsed_ingredients:
-            # Если ИИ вернул пустой список (например, текст вообще не про еду)
-            await status_msg.edit_text(
-                "❌ <b>Не удалось найти ингредиенты.</b>\n\n"
-                "Убедись, что в тексте есть продукты и их количества, или попробуй перефразировать ввод."
-            )
+            await status_msg.edit_text("❌ Не удалось найти ингредиенты.")
             return
-        
-        db.save_ingredients(user_id, parsed_ingredients)
             
-        # Формируем финальный ответ
-        response_text = "<b>📋 Ингредиенты успешно извлечены:</b>\n"
-        response_text += "────────────────────\n"
+        db.save_ingredients(user_id, recipe_name, parsed_ingredients)
         
+        response_text = f"<b>📋 Добавлено в '{recipe_name}':</b>\n"
+        response_text += "────────────────────\n"
         for item in parsed_ingredients:
-            name = item.get('name', 'Неизвестный продукт').capitalize()
+            name = item.get('name', 'Неизвестно').capitalize()
             amount = item.get('amount', 1.0)
             unit = item.get('unit', 'шт')
             
-            # Форматируем числа (убираем .0, если число целое)
             if isinstance(amount, float) and amount.is_integer():
                 amount = int(amount)
-                
-            response_text += f"🔸 <b>{name}</b> — <code>{amount} {unit}</code>\n"
+            response_text += f"🔹 <b>{name}</b> — <code>{amount} {unit}</code>\n"
             
+        response_text += "────────────────────\n"
+        response_text += "💾 <i>Сохранено! Вы можете посмотреть общий итог в меню '📊 Мой список продуктов'.</i>"
         
-        # Редактируем старое сообщение вместо отправки нового, чтобы не спамить в чате
         await status_msg.edit_text(response_text)
         
     except Exception as e:
-        logging.error(f"Ошибка в хэндлере ТГ: {e}")
-        # Сообщение на случай перегрузки бесплатных серверов
+        logging.error(f"Ошибка в быстром хэндлере ТГ: {e}")
         await status_msg.edit_text("⏳ Сервер ИИ занят, попробуйте отправить текст еще раз через пару секунд!")
 
 async def main() -> None:
