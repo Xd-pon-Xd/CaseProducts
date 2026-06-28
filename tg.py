@@ -14,9 +14,11 @@ from aiogram.fsm.state import StatesGroup, State
 from LLM_Parser import parse_ingredients_with_llm
 # Подключаем database.py
 import database as db
+# Подключаем парсер по ссылке
+from link_parser import get_text_via_bs4
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+#sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+#sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 
@@ -77,7 +79,53 @@ async def process_recipe_name(message: Message, state: FSMContext):
     # Переключаем в состояние ожидания рецепта
     await state.set_state(RecipeStates.waiting_for_recipe_text)
 
-# --- ФИНАЛ СЦЕНАРИЯ: ИИ + ЗАПИСЬ С НАЗВАНИЕМ БЛЮДА ---
+# --- ЛОВИМ ССЫЛКУ ВНУТРИ СЦЕНАРИЯ КНОПКИ ---
+@dp.message(RecipeStates.waiting_for_recipe_text, F.text.startswith("http"))
+async def process_recipe_url_in_flow(message: Message, state: FSMContext):
+    url = message.text.strip()
+    user_id = message.from_user.id
+    
+    user_data = await state.get_data()
+    recipe_name = user_data.get('chosen_recipe_name', 'Без названия')
+    
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    status_msg = await message.answer("🌐 <b>Скачиваю кулинарный сайт по твоей ссылке...</b>")
+    
+    # Вызываем асинхронную функцию из файла ssilka.py
+    site_text = await get_text_via_bs4(url)
+    
+    if not site_text or site_text.startswith("Ошибка") or len(site_text) < 50:
+        await status_msg.edit_text("❌ Не удалось прочитать рецепт по этой ссылке. Возможно, сайт защищен от роботов. Попробуй скопировать текст вручную!")
+        return
+
+    await status_msg.edit_text("🧠 <b>ИИ извлекает ингредиенты из текста сайта...</b>")
+    
+    try:
+        parsed_ingredients = await parse_ingredients_with_llm(site_text)
+        if not parsed_ingredients:
+            await status_msg.edit_text("❌ ИИ не смог найти ингредиенты на этом сайте.")
+            return
+            
+        db.save_ingredients(user_id, recipe_name, parsed_ingredients)
+        
+        response_text = f"<b>📋 Спарсено с сайта в рецепт '{recipe_name}':</b>\n"
+        response_text += "────────────────────\n"
+        for item in parsed_ingredients:
+            name = item.get('name', 'Неизвестно').capitalize()
+            amount = item.get('amount', 1.0)
+            unit = item.get('unit', 'шт')
+            if isinstance(amount, float) and amount.is_integer(): amount = int(amount)
+            response_text += f"🔹 <b>{name}</b> — <code>{amount} {unit}</code>\n"
+        response_text += "────────────────────\n💾 <i>Сохранено!</i>"
+        
+        await status_msg.edit_text(response_text)
+        await state.clear()
+        
+    except Exception as e:
+        logging.error(f"Ошибка ИИ при разборе текста сайта: {e}")
+        await status_msg.edit_text("⏳ Ошибка ИИ сервера. Попробуйте еще раз.")
+
+# --- ФИНАЛ СЦЕНАРИЯ ---
 @dp.message(RecipeStates.waiting_for_recipe_text)
 async def process_recipe_text(message: Message, state: FSMContext):
     raw_text = message.text
@@ -202,6 +250,46 @@ async def process_photo_handler(message: Message) -> None:
         "📸 Вижу твою фотку! Модуль EasyOCR уже на подходе. "
         "Совсем скоро ты сможешь загружать сюда рукописные рецепты, и я их распаршу!"
     )
+
+# --- ЛОВИМ ССЫЛКУ, ПРИСЛАННУЮ НАПРЯМУЮ БЕЗ КНОПОК ---
+@dp.message(F.text.startswith("http"))
+async def process_recipe_url_direct(message: Message) -> None:
+    url = message.text.strip()
+    user_id = message.from_user.id
+    recipe_name = "Быстрый рецепт по ссылке"
+    
+    await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    status_msg = await message.answer("🌐 <b>Анализирую быстрый рецепт по ссылке...</b>")
+    
+    site_text = await get_text_via_bs4(url)
+    
+    if not site_text or site_text.startswith("Ошибка") or len(site_text) < 50:
+        await status_msg.edit_text("❌ Не удалось загрузить сайт. Скопируйте текст рецепта вручную!")
+        return
+        
+    try:
+        parsed_ingredients = await parse_ingredients_with_llm(site_text)
+        if not parsed_ingredients:
+            await status_msg.edit_text("❌ Не удалось извлечь ингредиенты.")
+            return
+            
+        db.save_ingredients(user_id, recipe_name, parsed_ingredients)
+        
+        response_text = f"<b>📋 Добавлено из ссылки в '{recipe_name}':</b>\n"
+        response_text += "────────────────────\n"
+        for item in parsed_ingredients:
+            name = item.get('name', 'Неизвестно').capitalize()
+            amount = item.get('amount', 1.0)
+            unit = item.get('unit', 'шт')
+            if isinstance(amount, float) and amount.is_integer(): amount = int(amount)
+            response_text += f"🔹 <b>{name}</b> — <code>{amount} {unit}</code>\n"
+        response_text += "────────────────────\n💾 <i>Продукты добавлены в общий список!</i>"
+        
+        await status_msg.edit_text(response_text)
+        
+    except Exception as e:
+        logging.error(f"Ошибка в быстром URL хэндлере: {e}")
+        await status_msg.edit_text("⏳ Сервер ИИ занят, повторите попытку позже.")
 
 # Этот хэндлер ловит рецепты, которые прислали напрямую (без нажатия кнопки)
 @dp.message(F.text)
